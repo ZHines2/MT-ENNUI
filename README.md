@@ -1,24 +1,19 @@
 # MT-ENNUI
 scaling the peaks of nothingness between the poles
 
-## How to play
+## How to run
 
 Open `index.html` in any modern browser — no build step, no server required.
 
 ### Controls
 | Key | Action |
 |-----|--------|
-| `WASD` / Arrow keys | Move |
-| `V` | Toggle overhead ↔ side view |
-| `X` | Pick up flower |
-| `P` | Press carried flowers into journal *(safe zone only)* |
-| `N` | Plant / upgrade checkpoint *(safe zone only, costs flowers)* |
-| `H` | Rest *(safe zone only — recovers HP, stamina, warmth)* |
+| `Q` / `E` or `◄` / `►` | Rotate camera left / right (15° increments) |
+| `A` | Toggle auto-rotate (smooth continuous orbit) |
+| `Z` / `X` | Zoom in / out |
+| `R` | Generate a new random seed (new mountain) |
 
-### Quick overview
-- Collect **flowers** for temporary buffs while carried.
-- In a **safe zone**, press flowers into your **journal** for permanent buffs that survive death.
-- Plant a **checkpoint** by sacrificing flowers in a safe zone; flower types shape its bonuses.
-- Watch your **HP**, **stamina**, **exposure**, **altitude**, and the **day/night cycle** — the mountain is unforgiving.
-- **Dying** returns you to your last checkpoint and rolls back unexplored fog (checkpoints preserve their revealed areas).
-- Journal buffs are saved to `localStorage` and persist across sessions.
+### What you're looking at
+A procedurally generated mountain rendered as an ASCII side-view.  
+The seed number in the top bar uniquely identifies the terrain — the same seed always produces the same mountain.  
+Rolling valley fog fills the lowlands; rotating the camera reveals different faces of the peak.

@@ -3,782 +3,434 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MOUNT ENNUI</title>
+<title>MT-ENNUI</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { background: #000; color: #ccc; font-family: "Courier New", Courier, monospace; height: 100%; overflow: hidden; }
-#ui { display: flex; flex-direction: column; height: 100vh; }
-#hud {
-  display: flex; flex-wrap: wrap; gap: 6px 14px;
-  padding: 3px 8px; background: #0a0a14; border-bottom: 1px solid #223;
-  font-size: 12px; line-height: 1.6; min-height: 26px;
-}
-#hud span { white-space: nowrap; }
-#hud-hp   { color: #f66; }
-#hud-st   { color: #8df; }
-#hud-exp  { color: #fa8; }
-#hud-alt  { color: #aaa; }
-#hud-time { color: #dc8; }
-#hud-wx   { color: #8cf; }
-#hud-view { color: #8f8; cursor: pointer; }
-#canvas-wrap {
-  flex: 1; background: #000; overflow: hidden;
-}
+html, body { background: #000; height: 100%; overflow: hidden; user-select: none; }
 canvas { display: block; }
-#inv-bar {
-  padding: 2px 8px; background: #0a0a14; border-top: 1px solid #223;
-  font-size: 11px; color: #ab8; min-height: 20px; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis;
-}
-#msg-bar {
-  padding: 2px 8px; background: #0d0d1a; border-top: 1px solid #223;
-  font-size: 11px; color: #bbb; min-height: 20px;
-}
-#hints {
-  position: fixed; bottom: 68px; right: 6px;
-  background: rgba(0,0,0,0.82); border: 1px solid #334;
-  padding: 5px 8px; font-size: 10px; line-height: 1.7; color: #778;
-  pointer-events: none;
-}
-#hints b { color: #9ab; }
 </style>
 </head>
 <body>
-<div id="ui">
-  <div id="hud">
-    <span id="hud-hp">HP:100</span>
-    <span id="hud-st">ST:100</span>
-    <span id="hud-exp">EXP:0%</span>
-    <span id="hud-alt">ALT:0</span>
-    <span id="hud-time">06:00 D1</span>
-    <span id="hud-wx">clear 15C</span>
-    <span id="hud-view">[V] OVERHEAD</span>
-  </div>
-  <div id="canvas-wrap"><canvas id="gc"></canvas></div>
-  <div id="inv-bar">CARRIED: (none) | JOURNAL: (none) | BUFFS: -</div>
-  <div id="msg-bar">Welcome to MOUNT ENNUI. Scale the peaks. Survive the mountain.</div>
-</div>
-<div id="hints">
-  <b>WASD</b> / Arrows: Move &nbsp; <b>V</b>: Toggle view<br>
-  <b>X</b>: Pick up flower &nbsp; <b>P</b>: Press into journal*<br>
-  <b>N</b>: Plant checkpoint* &nbsp; <b>H</b>: Rest*<br>
-  <i>* safe zones only</i>
-</div>
+<canvas id="gc"></canvas>
 <script>
 (function () {
 'use strict';
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
-var WW = 200, WH = 200;          // world tiles
-var VC = 72,  VR = 26;           // viewport columns / rows
-var CH = 16;                     // cell height px (font line height)
-var CW = 9;                      // cell width px  (updated after font measure)
-var DAY   = 2400;                // ticks per day
-var TICK  = 120;                 // ms per game tick
-var SIGHT = 8;                   // fog reveal radius during play
-var START = 18;                  // fog reveal radius on spawn
-var MAX_CARRY = 8;
-var CP_COST   = 3;               // flowers to plant a checkpoint
-var CP_UP     = 5;               // flowers to upgrade
+var N = 128;   // world grid side (heightmap is N×N)
 
-// Terrain height bands  (0-255)
-var TB = { VALLEY:35, MEADOW:60, FOREST:85, SCRUB:110,
-           ALPINE:140, ROCKY:170, CLIFF:200, PEAK:230 };
-
-var GLYPHS = [
-  { max: TB.VALLEY, g:'~', c:'#4499cc' },
-  { max: TB.MEADOW, g:'.', c:'#55bb44' },
-  { max: TB.FOREST, g:'T', c:'#337722' },
-  { max: TB.SCRUB,  g:',', c:'#669944' },
-  { max: TB.ALPINE, g:';', c:'#887755' },
-  { max: TB.ROCKY,  g:'+', c:'#aa9966' },
-  { max: TB.CLIFF,  g:'#', c:'#999999' },
-  { max: TB.PEAK,   g:'^', c:'#cccccc' },
-  { max: 999,       g:'=', c:'#ddeeff' }
-];
-
-var FLOWERS = [
-  { id:'e', name:'Edelweiss', color:'#ffffcc', buff:'endurance', desc:'+ST regen'        },
-  { id:'g', name:'Gentian',   color:'#8888ff', buff:'thermal',   desc:'-exposure rate'   },
-  { id:'r', name:'Rose',      color:'#ff8888', buff:'healing',   desc:'+HP regen'        },
-  { id:'w', name:'Snowbell',  color:'#aaffff', buff:'cold',      desc:'-cold damage'     },
-  { id:'a', name:'Arnica',    color:'#ffcc44', buff:'toughness', desc:'-slope penalty'   }
-];
-
-// ─── NOISE / WORLD GEN ───────────────────────────────────────────────────────
-function hashN(x, y, s) {
-  var v = Math.sin(x * 127.1 + y * 311.7 + s * 74.3) * 43758.5453;
-  return v - Math.floor(v);
+// ─── SEEDED PRNG (xorshift32) ────────────────────────────────────────────────
+var _seed = 1;
+function srand(v) { _seed = ((v >>> 0) || 1); }
+function rand()   {
+  _seed ^= _seed << 13;
+  _seed ^= _seed >> 17;
+  _seed ^= _seed << 5;
+  return (_seed >>> 0) / 4294967296;
 }
-function lerp(a, b, t) { return a + t * (b - a); }
-function ss(t) { return t * t * (3 - 2 * t); }
-function noise2(x, y, s) {
-  var ix = Math.floor(x), iy = Math.floor(y);
-  var fx = x - ix, fy = y - iy;
-  var ux = ss(fx), uy = ss(fy);
-  return lerp(
-    lerp(hashN(ix,iy,s),   hashN(ix+1,iy,s),   ux),
-    lerp(hashN(ix,iy+1,s), hashN(ix+1,iy+1,s), ux),
-    uy
-  );
+
+// ─── VALUE NOISE + FBM ───────────────────────────────────────────────────────
+function _ss(t)       { return t * t * (3 - 2 * t); }
+function _lp(a, b, t) { return a + t * (b - a); }
+function vnoise(x, y, s) {
+  var ix = x | 0, iy = y | 0;
+  var fx = _ss(x - ix), fy = _ss(y - iy);
+  var h = function (px, py) {
+    var n = Math.sin(px * 127.1 + py * 311.7 + s * 74.3) * 43758.5453;
+    return n - Math.floor(n);
+  };
+  return _lp(_lp(h(ix, iy), h(ix + 1, iy), fx),
+             _lp(h(ix, iy + 1), h(ix + 1, iy + 1), fx), fy);
 }
-function fbm(x, y, s) {
-  var v=0, a=1, f=1, t=0;
-  for (var i=0; i<5; i++) { v += noise2(x*f, y*f, s+i*100)*a; t+=a; a*=0.5; f*=2.1; }
+function fbm(x, y, s, octs) {
+  octs = octs || 7;
+  var v = 0, a = 0.5, f = 1, t = 0;
+  for (var i = 0; i < octs; i++) {
+    v += vnoise(x * f, y * f, s + i * 97) * a;
+    t += a; a *= 0.5; f *= 2.1;
+  }
   return v / t;
 }
 
-function genWorld() {
-  // seeded RNG
-  var rs = 42;
-  function rnd() { rs = (rs*1664525+1013904223)>>>0; return rs/0xffffffff; }
+// ─── WORLD DATA ──────────────────────────────────────────────────────────────
+// hmap   – elevation   0..1  (world-space heightfield)
+// fogmap – fog density 0..1  (world-space; future-proof for fog-of-war reveal)
+//   Architecture note: fogmap stores the BASE atmospheric fog.
+//   A future reveal mechanic would track an explored[] boolean grid separately
+//   and composite: visibleFog = explored[i] ? fogmap[i] : 1.0
+var hmap   = new Float32Array(N * N);
+var fogmap = new Float32Array(N * N);
+var curSeed = 0;
 
-  var cells = new Array(WW * WH);
+function genWorld(seed) {
+  curSeed = seed;
+  srand(seed);
 
-  // Mountain peaks
-  var peaks = [];
-  for (var pi=0; pi<9; pi++) {
-    peaks.push({ x: 20+rnd()*(WW-40), y: 20+rnd()*(WH-40), h: 155+rnd()*100, r: 16+rnd()*38 });
-  }
-  peaks.push({ x: WW*0.5, y: WH*0.4, h: 255, r: 42 }); // Mount Ennui
-
-  for (var i=0; i<WW*WH; i++) {
-    var wx = i % WW, wy = Math.floor(i / WW);
-    var h = fbm(wx/WW*4, wy/WH*4, 42) * 80;
-    for (var p=0; p<peaks.length; p++) {
-      var dx = wx-peaks[p].x, dy = wy-peaks[p].y;
-      var d = Math.sqrt(dx*dx+dy*dy);
-      var t = Math.max(0, 1 - d/peaks[p].r);
-      h += t*t * peaks[p].h;
-    }
-    cells[i] = {
-      h:    Math.min(255, Math.max(0, h)),
-      fog:  2,    // 0=visible 1=explored 2=unknown
-      trail:-1,   // -1=none  >=0 age in ticks
-      safe: false,
-      base: false,
-      cp:   null
-    };
+  // Central summit + random secondary peaks
+  var peaks = [{ x: N / 2, z: N / 2, h: 1.0, r: N * 0.28 }];
+  for (var i = 0; i < 5; i++) {
+    peaks.push({
+      x: rand() * N * 0.6 + N * 0.2,
+      z: rand() * N * 0.6 + N * 0.2,
+      h: rand() * 0.52 + 0.28,
+      r: rand() * N * 0.13 + N * 0.06
+    });
   }
 
-  // Mark safe zones at valley floors
-  var safeZones = [];
-  for (var sy=8; sy<WH-8; sy+=14) {
-    for (var sx=8; sx<WW-8; sx+=14) {
-      if (cells[sy*WW+sx].h <= TB.MEADOW) {
-        var sr = 7;
-        safeZones.push({ x:sx, y:sy, r:sr });
-        for (var dy=-sr; dy<=sr; dy++) for (var sdx=-sr; sdx<=sr; sdx++) {
-          if (sdx*sdx+dy*dy <= sr*sr) {
-            var nx=sx+sdx, ny=sy+dy;
-            if (nx>=0&&nx<WW&&ny>=0&&ny<WH) cells[ny*WW+nx].safe=true;
-          }
-        }
+  for (var zi = 0; zi < N; zi++) {
+    for (var xi = 0; xi < N; xi++) {
+      var base = fbm(xi / N * 5, zi / N * 5, seed) * 0.28;
+      var pk = 0;
+      for (var pi = 0; pi < peaks.length; pi++) {
+        var ddx = (xi - peaks[pi].x) / peaks[pi].r;
+        var ddz = (zi - peaks[pi].z) / peaks[pi].r;
+        var tt = Math.max(0, 1 - (ddx * ddx + ddz * ddz));
+        pk = Math.max(pk, tt * tt * peaks[pi].h);
       }
+      hmap[zi * N + xi] = Math.min(1, Math.max(0, base + pk));
     }
   }
 
-  // Base camp: lowest cell in lower-middle rows (well away from world edge)
-  var baseX=Math.floor(WW/2), baseY=Math.floor(WH*0.7), minH=9999;
-  for (var by=Math.floor(WH*0.6); by<Math.floor(WH*0.8); by++) {
-    for (var bx=4; bx<WW-4; bx++) {
-      if (cells[by*WW+bx].h < minH) { minH=cells[by*WW+bx].h; baseX=bx; baseY=by; }
-    }
-  }
-  cells[baseY*WW+baseX].base = true;
-  var br=9;
-  for (var dby=-br; dby<=br; dby++) for (var dbx=-br; dbx<=br; dbx++) {
-    if (dbx*dbx+dby*dby<=br*br) {
-      var bnx=baseX+dbx, bny=baseY+dby;
-      if (bnx>=0&&bnx<WW&&bny>=0&&bny<WH) cells[bny*WW+bnx].safe=true;
-    }
-  }
-
-  // Scatter flowers at alpine elevations
-  var flowers = [];
-  for (var fi=0; fi<350; fi++) {
-    var fx=4+Math.floor(rnd()*(WW-8)), fy=4+Math.floor(rnd()*(WH-8));
-    var fh=cells[fy*WW+fx].h;
-    if (fh>=45 && fh<=190) {
-      flowers.push({ x:fx, y:fy, type:FLOWERS[Math.floor(rnd()*FLOWERS.length)], picked:false });
-    }
-  }
-
-  return { cells:cells, flowers:flowers, checkpoints:[], baseX:baseX, baseY:baseY };
-}
-
-// ─── GAME STATE ───────────────────────────────────────────────────────────────
-var W;        // world
-var GS;       // 'playing' | 'dead'
-var VIEW;     // 'overhead' | 'side'
-var tick;
-var msgs;
-
-var P = { x:0, y:0, hp:100, maxHp:100, st:100, maxSt:100, exp:0,
-          carried:[], cpX:-1, cpY:-1, deaths:0 };
-var J = { flowers:[] };   // journal
-var WX = { state:'clear', timer:400, temp:15 };
-
-// ─── INIT ─────────────────────────────────────────────────────────────────────
-function init() {
-  W    = genWorld();
-  GS   = 'playing';
-  VIEW = 'overhead';
-  tick = 0;
-  msgs = [];
-
-  try { var s = localStorage.getItem('mtennui-j'); if (s) J = JSON.parse(s); } catch(e) {}
-
-  P.x=W.baseX; P.y=W.baseY; P.hp=P.maxHp; P.st=P.maxSt; P.exp=0;
-  P.carried=[]; P.cpX=W.baseX; P.cpY=W.baseY; P.deaths=0;
-
-  reveal(P.x, P.y, START);
-  msg('Welcome to MOUNT ENNUI. Scale the peaks. Survive. [WASD/Arrows=Move V=View X=Pickup P=Press N=Checkpoint H=Rest]');
-  updateHUD();
-}
-
-// ─── FOG OF WAR ───────────────────────────────────────────────────────────────
-function reveal(cx, cy, r) {
-  for (var dy=-r; dy<=r; dy++) for (var dx=-r; dx<=r; dx++) {
-    if (dx*dx+dy*dy <= r*r) {
-      var nx=cx+dx, ny=cy+dy;
-      if (nx>=0&&nx<WW&&ny>=0&&ny<WH && W.cells[ny*WW+nx].fog > 0)
-        W.cells[ny*WW+nx].fog = 0;
+  // Fog: dense in basins (inversely proportional to elevation),
+  // with spatial fbm variation for rolling/patchy appearance.
+  for (var zi2 = 0; zi2 < N; zi2++) {
+    for (var xi2 = 0; xi2 < N; xi2++) {
+      var hv = hmap[zi2 * N + xi2];
+      var basin = Math.max(0, 1 - hv * 3.5) * 0.72;
+      var vary  = fbm(xi2 / N * 4 + 11.3, zi2 / N * 4 + 7.1, seed + 500, 4)
+                  * 0.35 * Math.max(0, 1 - hv * 1.8);
+      fogmap[zi2 * N + xi2] = Math.min(1, basin + vary);
     }
   }
 }
 
-function stepFog() {
-  for (var i=0; i<W.cells.length; i++)
-    if (W.cells[i].fog === 0) W.cells[i].fog = 1;
-  reveal(P.x, P.y, SIGHT);
+// Bilinear sampler for heightmap
+function sh(wx, wz) {
+  wx = Math.max(0, Math.min(N - 1.001, wx));
+  wz = Math.max(0, Math.min(N - 1.001, wz));
+  var ix = wx | 0, iz = wz | 0;
+  var fx = wx - ix, fz = wz - iz;
+  var i00 = iz * N + ix;
+  return hmap[i00]         * (1 - fx) * (1 - fz)
+       + hmap[i00 + 1]     * fx       * (1 - fz)
+       + hmap[i00 + N]     * (1 - fx) * fz
+       + hmap[i00 + N + 1] * fx       * fz;
 }
 
-function fogRollback() {
-  var zones = [{ x:W.baseX, y:W.baseY, r:12 }];
-  for (var ci=0; ci<W.checkpoints.length; ci++) {
-    var cp=W.checkpoints[ci];
-    zones.push({ x:cp.x, y:cp.y, r:8+cp.level*3 });
+// Bilinear sampler for fogmap
+function sfog(wx, wz) {
+  wx = Math.max(0, Math.min(N - 1.001, wx));
+  wz = Math.max(0, Math.min(N - 1.001, wz));
+  var ix = wx | 0, iz = wz | 0;
+  var fx = wx - ix, fz = wz - iz;
+  var i00 = iz * N + ix;
+  return fogmap[i00]         * (1 - fx) * (1 - fz)
+       + fogmap[i00 + 1]     * fx       * (1 - fz)
+       + fogmap[i00 + N]     * (1 - fx) * fz
+       + fogmap[i00 + N + 1] * fx       * fz;
+}
+
+// ─── COLOR RAMP (pre-computed 256-entry lookup table) ────────────────────────
+// elevation 0=valley → 1=snow peak, smoothly interpolated
+var _RAMP_N = 256;
+var _RAMP   = new Uint8Array(_RAMP_N * 3);
+(function () {
+  // [elevation_stop, r, g, b]
+  var stops = [
+    [0.00,  24,  45,  85],   // deep shadow / water
+    [0.05,  38,  70, 110],   // valley bottom
+    [0.12,  50,  93,  52],   // lowland grass
+    [0.22,  66, 115,  46],   // meadow
+    [0.35,  40,  85,  33],   // forest
+    [0.46,  86,  78,  50],   // scrub / heath
+    [0.58, 128, 116,  80],   // rocky
+    [0.72, 150, 141, 131],   // cliff
+    [0.86, 193, 190, 183],   // peak
+    [1.00, 230, 234, 240]    // snow summit
+  ];
+  for (var i = 0; i < _RAMP_N; i++) {
+    var h = i / (_RAMP_N - 1), si = 1;
+    while (si < stops.length - 1 && h > stops[si][0]) si++;
+    var lo = stops[si - 1], hi = stops[si];
+    var tt = (lo[0] === hi[0]) ? 0 : (h - lo[0]) / (hi[0] - lo[0]);
+    tt = tt * tt * (3 - 2 * tt); // smoothstep
+    _RAMP[i * 3]     = (lo[1] + tt * (hi[1] - lo[1])) | 0;
+    _RAMP[i * 3 + 1] = (lo[2] + tt * (hi[2] - lo[2])) | 0;
+    _RAMP[i * 3 + 2] = (lo[3] + tt * (hi[3] - lo[3])) | 0;
   }
-  for (var i=0; i<W.cells.length; i++) {
-    if (W.cells[i].fog !== 1) continue;
-    var wx=i%WW, wy=Math.floor(i/WW), keep=false;
-    for (var z=0; z<zones.length; z++) {
-      if ((wx-zones[z].x)*(wx-zones[z].x)+(wy-zones[z].y)*(wy-zones[z].y) <= zones[z].r*zones[z].r)
-        { keep=true; break; }
-    }
-    if (!keep) W.cells[i].fog = 2;
-  }
+}());
+
+// ─── CAMERA ──────────────────────────────────────────────────────────────────
+var camAngle   = 0.4;   // orbit angle (radians)
+var camZoom    = 1.0;   // zoom factor  0.35 … 3.0
+var autoRotate = false;
+var ROT_STEP   = Math.PI / 12;   // 15° per manual key press
+var AUTO_RATE  = 0.00045;        // rad / ms  (smooth auto-rotate)
+
+// ─── CANVAS ──────────────────────────────────────────────────────────────────
+// Two-layer approach:
+//   offscreen – half-res pixel buffer for terrain (cheap putImageData)
+//   canvas    – full-res main canvas: receives scaled terrain + HUD text
+var canvas, ctx;
+var offscreen, offCtx;
+var PW = 1, PH = 1;   // offscreen pixel dimensions
+
+function initCanvas() {
+  canvas    = document.getElementById('gc');
+  ctx       = canvas.getContext('2d');
+  offscreen = document.createElement('canvas');
+  offCtx    = offscreen.getContext('2d');
+  resize();
+}
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  PW = Math.max(1, canvas.width  >> 1);  // half screen → upscaled 2× for terrain
+  PH = Math.max(1, canvas.height >> 1);
+  offscreen.width  = PW;
+  offscreen.height = PH;
+  _imgData = null;   // force ImageData recreate next frame
 }
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function getCell(x, y) {
-  if (x<0||x>=WW||y<0||y>=WH) return null;
-  return W.cells[y*WW+x];
-}
-function getH(x, y) { var c=getCell(x,y); return c?c.h:0; }
-function isSafe(x, y) { var c=getCell(x,y); return c&&c.safe; }
-
-function terrainOf(h) {
-  for (var i=0; i<GLYPHS.length; i++) if (h<=GLYPHS[i].max) return GLYPHS[i];
-  return GLYPHS[GLYPHS.length-1];
-}
-function flowerAt(x, y) {
-  for (var i=0; i<W.flowers.length; i++) {
-    var f=W.flowers[i];
-    if (!f.picked && f.x===x && f.y===y) return f;
-  }
-  return null;
-}
-function nearCP(x, y) {
-  for (var i=0; i<W.checkpoints.length; i++) {
-    var cp=W.checkpoints[i];
-    if (Math.abs(cp.x-x)<=2 && Math.abs(cp.y-y)<=2) return cp;
-  }
-  return null;
-}
-
-function dimHex(hex, f) {
-  if (!hex||hex[0]!=='#'||hex.length<7) return hex;
-  var r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
-  return 'rgb('+Math.round(r*f)+','+Math.round(g*f)+','+Math.round(b*f)+')';
-}
-
-function getBuffs() {
-  var b={};
-  for (var i=0; i<J.flowers.length; i++) b[J.flowers[i].buff]=true;
-  for (var j=0; j<P.carried.length; j++) b[P.carried[j].buff]=true;
-  return b;
-}
-function saveJ() { try { localStorage.setItem('mtennui-j', JSON.stringify(J)); } catch(e){} }
-function msg(m) {
-  msgs.unshift(m); if (msgs.length>20) msgs.pop();
-  document.getElementById('msg-bar').textContent = m;
-}
-
-// ─── MOVEMENT ─────────────────────────────────────────────────────────────────
-function move(dx, dy) {
-  if (GS !== 'playing') return;
-  var nx=P.x+dx, ny=P.y+dy;
-  if (nx<0||nx>=WW||ny<0||ny>=WH) return;
-
-  var fromH=getH(P.x,P.y), toH=getH(nx,ny), slope=toH-fromH;
-  var B=getBuffs();
-
-  var cost=1;
-  if (slope > 10) cost += Math.ceil((slope-10)/10);
-  if (WX.state==='blizzard') cost+=2;
-  else if (WX.state==='snow') cost+=1;
-  if (B.toughness) cost = Math.max(1, cost-1);
-
-  if (P.st < cost) { msg('Too exhausted. Rest in a safe zone [H].'); return; }
-
-  var oc=getCell(P.x,P.y); if (oc) oc.trail=0;
-  P.x=nx; P.y=ny;
-  P.st=Math.max(0, P.st-cost);
-  stepFog();
-
-  var fl=flowerAt(P.x,P.y);
-  var cc=getCell(P.x,P.y);
-  if (fl) {
-    msg('['+fl.type.id+'] '+fl.type.name+' here ('+fl.type.desc+'). [X] pick up.');
-  } else if (cc&&cc.safe) {
-    var lbl = cc.base ? 'Base Camp' : 'Safe zone';
-    msg(lbl+'. [H]rest  [P]press flowers into journal  [N]plant/upgrade checkpoint');
-  } else if (toH >= 230) {
-    msg('!!! You reached a summit of MOUNT ENNUI !!!');
-  }
-  updateHUD();
-}
-
-// ─── PLAYER ACTIONS ──────────────────────────────────────────────────────────
-function doPickup() {
-  if (GS!=='playing') return;
-  var fl=flowerAt(P.x,P.y);
-  if (!fl) { msg('No flower here.'); return; }
-  if (P.carried.length>=MAX_CARRY) { msg('Carrying max flowers ('+MAX_CARRY+'). Press or plant first.'); return; }
-  fl.picked=true;
-  P.carried.push({ id:fl.type.id, name:fl.type.name, color:fl.type.color, buff:fl.type.buff, desc:fl.type.desc });
-  msg('Picked '+fl.type.name+'. ['+P.carried.length+'/'+MAX_CARRY+'] '+fl.type.desc);
-  updateHUD();
-}
-
-function doPress() {
-  if (GS!=='playing') return;
-  if (!isSafe(P.x,P.y)) { msg('Press flowers only in a safe zone.'); return; }
-  if (P.carried.length===0) { msg('Nothing to press. Pick up flowers first.'); return; }
-  var names=[];
-  for (var i=0; i<P.carried.length; i++) {
-    J.flowers.push({ type:{ id:P.carried[i].id, name:P.carried[i].name },
-                     buff:P.carried[i].buff, desc:P.carried[i].desc });
-    names.push(P.carried[i].name);
-  }
-  P.carried=[];
-  saveJ();
-  msg('Pressed into journal: '+names.join(', ')+'. Permanent buffs gained!');
-  updateHUD();
-}
-
-function doPlant() {
-  if (GS!=='playing') return;
-  if (!isSafe(P.x,P.y)) { msg('Plant checkpoints only in safe zones.'); return; }
-  var existing=nearCP(P.x,P.y);
-  var cost=existing ? CP_UP : CP_COST;
-  if (P.carried.length<cost) {
-    msg('Need '+cost+' flowers to '+(existing?'upgrade':'plant')+' checkpoint. Have '+P.carried.length+'.');
-    return;
-  }
-  var types=P.carried.map(function(f){return f.id;});
-  if (existing) {
-    existing.level++;
-    for (var i=0; i<types.length; i++) existing.types.push(types[i]);
-    P.cpX=existing.x; P.cpY=existing.y;
-    msg('Checkpoint upgraded to Lv'+existing.level+'! Reinforced: '+types.join(''));
-    reveal(existing.x, existing.y, 8+existing.level*2);
-  } else {
-    var cp={ x:P.x, y:P.y, level:1, types:types };
-    W.checkpoints.push(cp);
-    W.cells[P.y*WW+P.x].cp=cp;
-    P.cpX=P.x; P.cpY=P.y;
-    msg('Checkpoint planted! Reinforced: '+types.join(''));
-    reveal(P.x, P.y, 10);
-  }
-  P.carried=[];
-  updateHUD();
-}
-
-function doRest() {
-  if (GS!=='playing') return;
-  if (!isSafe(P.x,P.y)) { msg('Rest only in safe zones.'); return; }
-  P.st  = Math.min(P.maxSt,  P.st  + 35);
-  P.hp  = Math.min(P.maxHp,  P.hp  + 15);
-  P.exp = Math.max(0,         P.exp - 25);
-  msg('Rested. Stamina and warmth partially restored.');
-  updateHUD();
-}
-
-// ─── WEATHER & TIME ───────────────────────────────────────────────────────────
-function tickSim() {
-  tick++;
-
-  // Weather transitions
-  WX.timer--;
-  if (WX.timer <= 0) {
-    var af=getH(P.x,P.y)/255;
-    var pool=['clear','clear','cloudy','cloudy','rain'];
-    if (af>0.35) pool.push('snow');
-    if (af>0.55) { pool.push('snow','blizzard'); }
-    if (af>0.70) pool=pool.filter(function(s){return s!=='rain';});
-    WX.state=pool[Math.floor(Math.random()*pool.length)];
-    WX.timer=180+Math.floor(Math.random()*360);
-    msg('Weather changed: '+WX.state+'.');
-  }
-
-  // Temperature
-  var dayP=(tick%DAY)/DAY, hr=dayP*24;
-  var isNight=(hr<6||hr>=20);
-  var ah=getH(P.x,P.y);
-  WX.temp = 15 - (ah/255)*35
-    + (isNight?-12:5)
-    + (WX.state==='blizzard'?-20 : WX.state==='snow'?-10 : WX.state==='rain'?-5 : 0);
-
-  // Physics every 10 ticks (~1.2s)
-  if (tick%10!==0) return;
-  var B=getBuffs();
-
-  // Exposure
-  var expD=0;
-  if (WX.temp<0) expD += Math.abs(WX.temp)*0.15;
-  if (WX.state==='blizzard') expD+=4;
-  else if (WX.state==='snow') expD+=1.5;
-  if (isNight) expD+=0.8;
-  if (B.thermal)   expD*=0.6;
-  if (B.cold)      expD=Math.max(0,expD-0.8);
-  if (isSafe(P.x,P.y)) expD*=0.2;
-  P.exp=Math.min(100, P.exp+expD);
-
-  // HP drain from exposure
-  if (P.exp>65) {
-    var drain=(P.exp-65)/80; if (B.toughness) drain*=0.7;
-    P.hp=Math.max(0, P.hp-drain);
-  }
-  // HP regen from healing buff
-  if (B.healing && P.hp<P.maxHp) P.hp=Math.min(P.maxHp, P.hp+0.5);
-
-  // Altitude stamina drain (above rocky zone, outside safe)
-  if (ah>160 && !isSafe(P.x,P.y)) {
-    P.st=Math.max(0, P.st-(ah-160)/255*1.5);
-  }
-  // Stamina regen
-  var sregen = isSafe(P.x,P.y) ? 0.5 : 0.05;
-  if (B.endurance) sregen+=0.3;
-  P.st=Math.min(P.maxSt, P.st+sregen);
-
-  // Trail aging
-  for (var i=0; i<W.cells.length; i++) {
-    if (W.cells[i].trail>=0) { W.cells[i].trail++; if (W.cells[i].trail>40) W.cells[i].trail=-1; }
-  }
-
-  if (P.hp<=0 || P.st<=0) { die(); return; }
-  updateHUD();
-}
-
-function die() {
-  if (GS==='dead') return;
-  GS='dead'; P.deaths++; P.carried=[];
-  msg('You perished on the mountain. Death #'+P.deaths+'. Carried flowers lost.');
-  fogRollback();
-  updateHUD();
-  setTimeout(respawn, 2600);
-}
-
-function respawn() {
-  P.x = P.cpX>=0 ? P.cpX : W.baseX;
-  P.y = P.cpY>=0 ? P.cpY : W.baseY;
-  P.hp=P.maxHp*0.6; P.st=P.maxSt*0.6; P.exp=20;
-  GS='playing';
-  reveal(P.x, P.y, START);
-  msg('Returned to checkpoint. The mountain still waits.');
-  updateHUD();
-}
-
-// ─── HUD ─────────────────────────────────────────────────────────────────────
-function updateHUD() {
-  var ah=getH(P.x,P.y);
-  var dayP=(tick%DAY)/DAY, hr=Math.floor(dayP*24), mn=Math.floor((dayP*24-hr)*60);
-  var day=Math.floor(tick/DAY)+1;
-  var B=getBuffs(), bList=Object.keys(B).join(' ')||'-';
-
-  document.getElementById('hud-hp').textContent  = 'HP:'+Math.ceil(P.hp)+'/'+P.maxHp;
-  document.getElementById('hud-st').textContent  = 'ST:'+Math.ceil(P.st)+'/'+P.maxSt;
-  document.getElementById('hud-exp').textContent = 'EXP:'+Math.round(P.exp)+'%';
-  document.getElementById('hud-alt').textContent = 'ALT:'+Math.round(ah);
-  document.getElementById('hud-time').textContent=
-    ('0'+hr).slice(-2)+':'+('0'+mn).slice(-2)+' D'+day;
-  document.getElementById('hud-wx').textContent  = WX.state+' '+Math.round(WX.temp)+'C';
-  document.getElementById('hud-view').textContent= '[V] '+(VIEW==='overhead'?'OVERHEAD':'SIDE');
-
-  var cStr=P.carried.length
-    ? P.carried.map(function(f){return f.id+'('+f.name+')';}).join(' ')
-    : '(none)';
-  var jStr=J.flowers.length
-    ? J.flowers.map(function(f){return f.type.id;}).join('')
-    : '(none)';
-  document.getElementById('inv-bar').textContent=
-    'CARRIED['+P.carried.length+'/'+MAX_CARRY+']: '+cStr
-    +'  |  JOURNAL: '+jStr
-    +'  |  BUFFS: '+bList;
+// ─── GRAIN RNG (fast xorshift, separate from world PRNG) ─────────────────────
+var _gs = 1;
+function gr() {
+  _gs ^= _gs << 13; _gs ^= _gs >> 17; _gs ^= _gs << 5;
+  return (_gs >>> 0) / 4294967296;
 }
 
 // ─── RENDERING ───────────────────────────────────────────────────────────────
-var canvas, ctx;
-var FONT_SIZE = 14;
+var fogT     = 0;
+var _imgData = null;   // reused ImageData
 
-function initCanvas() {
-  canvas = document.getElementById('gc');
-  ctx    = canvas.getContext('2d');
-  resizeCanvas();
-}
+function render(ts) {
+  if (!ctx) return;
+  fogT = ts * 0.00022;
 
-function resizeCanvas() {
-  ctx.font = FONT_SIZE + 'px "Courier New", monospace';
-  CW = Math.ceil(ctx.measureText('M').width) + 1;
-  // Measure bar heights from the DOM, fall back to 70px
-  var hud = document.getElementById('hud');
-  var inv = document.getElementById('inv-bar');
-  var msgEl = document.getElementById('msg-bar');
-  var barsH = (hud ? hud.offsetHeight : 26)
-            + (inv ? inv.offsetHeight : 22)
-            + (msgEl ? msgEl.offsetHeight : 22);
-  var availW = window.innerWidth;
-  var availH = window.innerHeight - barsH;
-  VC = Math.max(40, Math.floor(availW / CW));
-  VR = Math.max(20, Math.floor(availH / CH));
-  canvas.width  = VC * CW;
-  canvas.height = VR * CH;
-  ctx.textBaseline = 'top';
-}
+  var W = PW, H = PH;
 
-function nightAlpha() {
-  var hr = ((tick%DAY)/DAY)*24;
-  if (hr>=7 && hr<19) return 0;
-  if (hr>=5 && hr<7)  return (1-(hr-5)/2)*0.75;  // dawn
-  if (hr>=19&& hr<21) return ((hr-19)/2)*0.75;    // dusk
-  return 0.78;
-}
+  // Allocate (or reuse) the ImageData pixel buffer
+  if (!_imgData || _imgData.width !== W || _imgData.height !== H) {
+    _imgData = offCtx.createImageData(W, H);
+  }
+  var buf = _imgData.data;
 
-function renderOverhead() {
-  var hc=Math.floor(VC/2), hr2=Math.floor(VR/2);
-  var sx=P.x-hc, sy=P.y-hr2;
+  // Camera direction vectors (orthographic orbit)
+  var fX = Math.cos(camAngle), fZ = Math.sin(camAngle);
+  var rX = -fZ,                rZ = fX;
+  var cx = N * 0.5,            cz = N * 0.5;
 
-  ctx.font= FONT_SIZE+'px "Courier New", monospace';
-  ctx.textBaseline='top';
+  // View geometry (world units)
+  var halfW = (N * 0.52) / camZoom;
+  var halfD = N * 0.62;
+  var step  = 1.5;   // world-unit depth step
 
-  for (var row=0; row<VR; row++) {
-    for (var col=0; col<VC; col++) {
-      var wx=sx+col, wy=sy+row;
-      var px=col*CW,  py=row*CH;
+  // Screen layout (pixel rows in the half-res buffer)
+  var skyH  = Math.max(2, (H * 0.09) | 0);
+  var gndY  = H - Math.max(2, (H * 0.025) | 0);
+  var terrH = gndY - skyH;
 
-      // background
-      ctx.fillStyle='#000';
-      ctx.fillRect(px, py, CW, CH);
+  // ── Per-column pre-scan ──────────────────────────────────────────────────
+  var colMaxH   = new Float32Array(W);
+  var colDepth  = new Float32Array(W);
+  var colFogMax = new Float32Array(W);
+  var colFogLow = new Float32Array(W);
+  var colRim    = new Float32Array(W);  // lateral slope shading
 
-      // player
-      if (wx===P.x && wy===P.y) {
-        ctx.fillStyle='#fff';
-        ctx.fillText('@', px, py);
-        continue;
-      }
+  for (var c = 0; c < W; c++) {
+    var lat = (c / (W - 1) - 0.5) * 2 * halfW;
+    var bx  = cx + lat * rX, bz = cz + lat * rZ;
 
-      var c=getCell(wx,wy);
-      if (!c) {
-        // out-of-bounds – show as impassable wall (same fog palette so screen stays readable)
-        ctx.fillStyle='#0d0d22';
-        ctx.fillRect(px, py, CW, CH);
-        ctx.fillStyle='#2a2a44';
-        ctx.fillText('#', px, py);
-        continue;
-      }
+    var maxH = 0, depthAtMax = 0, fogAtMax = 0, fogLowSum = 0, fogLowCnt = 0;
 
-      if (c.fog===2) {
-        // unexplored – fog glyph must NEVER look like empty black space
-        ctx.fillStyle='#0d0d22';
-        ctx.fillRect(px, py, CW, CH);
-        ctx.fillStyle='#4a4a7a';
-        ctx.fillText('?', px, py);
-        continue;
-      }
+    for (var d = -halfD; d <= halfD; d += step) {
+      var wx = bx + d * fX, wz = bz + d * fZ;
+      if (wx < 0 || wx >= N || wz < 0 || wz >= N) continue;
 
-      var dim=(c.fog===1);
-      var glyph, color;
+      var hv  = sh(wx, wz);
+      var fwx = wx + Math.cos(fogT + wz * 0.05) * 5.5;
+      var fwz = wz + Math.sin(fogT * 0.72 + wx * 0.04) * 4.5;
+      var fv  = sfog(fwx, fwz);
 
-      // base camp
-      if (c.base) {
-        glyph='B'; color=dim?dimHex('#ffaa00',0.35):'#ffaa00';
-      }
-      // checkpoint
-      else if (c.cp) {
-        glyph=(c.cp.level>=2?'C':'c');
-        color=dim?dimHex('#00ffcc',0.35):'#00ffcc';
-      }
-      // flower (only show in currently-visible cells to create exploration incentive)
-      else {
-        var fl=(!dim)?flowerAt(wx,wy):null;
-        if (fl) {
-          glyph=fl.type.id; color=fl.type.color;
+      if (hv > maxH) { maxH = hv; depthAtMax = d; fogAtMax = fv; }
+      if (hv < 0.28) { fogLowSum += fv; fogLowCnt++; }
+    }
+
+    colMaxH[c]   = maxH;
+    colDepth[c]  = depthAtMax;
+    colFogMax[c] = fogAtMax;
+    colFogLow[c] = fogLowCnt > 0 ? fogLowSum / fogLowCnt : 0;
+  }
+
+  // Lateral slope shading: left-lit (leftward slope = brighter)
+  for (var cc = 0; cc < W; cc++) {
+    var lh = cc > 0     ? colMaxH[cc - 1] : colMaxH[cc];
+    var rh = cc < W - 1 ? colMaxH[cc + 1] : colMaxH[cc];
+    colRim[cc] = (lh - rh) * 2.2;   // +ve = left face lit, −ve = right face shadowed
+  }
+
+  // ── Per-pixel rendering ──────────────────────────────────────────────────
+  _gs = ((ts * 7919 + 0xBEEF) | 1) >>> 0;  // reseed grain per frame
+
+  for (var y = 0; y < H; y++) {
+    var yW = y * W;
+
+    for (var x = 0; x < W; x++) {
+      var idx = (yW + x) << 2;
+
+      var maxH2 = colMaxH[x];
+      var df    = (colDepth[x] + halfD) / (2 * halfD);  // 0=near, 1=far
+      var fogM  = colFogMax[x];
+      var fogL  = colFogLow[x];
+      var peakY = (skyH + (1 - maxH2) * terrH) | 0;
+
+      var cr, cg, cb;
+
+      if (y < skyH) {
+        // ── Sky gradient ──
+        var st = y / skyH;
+        cr = ( 3 + st * 10) | 0;
+        cg = ( 4 + st *  8) | 0;
+        cb = (10 + st * 24) | 0;
+
+      } else if (y >= gndY) {
+        // ── Ground strip ──
+        cr = 14; cg = 18; cb = 14;
+
+      } else if (y < peakY) {
+        // ── Air above terrain silhouette ──
+        var rowAlt = 1 - (y - skyH) / terrH;
+        cr = 3; cg = 4; cb = 9;
+        // Valley fog bleeds upward into low-altitude air
+        if (rowAlt < 0.30 && fogL > 0.25) {
+          var fd = ((fogL - 0.25) / 0.75) * ((0.30 - rowAlt) / 0.30);
+          fd = fd * fd;
+          if (fd > 0.02) {
+            var fv2 = (50 + fd * 80) | 0;
+            cr = (_lp(cr, fv2,      fd * 0.65)) | 0;
+            cg = (_lp(cg, fv2 + 4,  fd * 0.65)) | 0;
+            cb = (_lp(cb, fv2 + 20, fd * 0.65)) | 0;
+          }
+        }
+
+      } else {
+        // ── Terrain ──
+        var rowAlt2 = 1 - (y - skyH) / terrH;
+
+        // Color from pre-computed ramp (smooth elevation gradient)
+        var ri  = Math.min(_RAMP_N - 1, (rowAlt2 * _RAMP_N) | 0);
+        var tcr = _RAMP[ri * 3], tcg = _RAMP[ri * 3 + 1], tcb = _RAMP[ri * 3 + 2];
+
+        // Shading: depth dimming + lateral slope rim light
+        var shd = Math.max(0.18, Math.min(1.5, (1.0 - df * 0.48) + colRim[x] * 0.5));
+
+        // Fog blend toward haze colour (88, 96, 124)
+        var fb;
+        if (y === peakY) {
+          shd += 0.18;  // rim glow at silhouette edge
+          fb   = fogM * 0.22;
         } else {
-          var t=terrainOf(c.h);
-          glyph=t.g;
-          // safe zone gets a green tint
-          color = c.safe
-            ? dimHex('#44ff88', dim?0.38:0.82)
-            : (dim?dimHex(t.c,0.38):t.c);
+          fb = Math.min(0.68, fogM * df * 0.60);
+        }
+
+        cr = (_lp(tcr * shd,  88, fb)) | 0;
+        cg = (_lp(tcg * shd,  96, fb)) | 0;
+        cb = (_lp(tcb * shd, 124, fb)) | 0;
+
+        // Valley fog overlay on low-altitude terrain cells
+        if (rowAlt2 < 0.22 && fogL > 0.30) {
+          var fld = Math.min(0.72, (fogL - 0.30) * (0.22 - rowAlt2) / 0.22 * 1.9);
+          var flv = (55 + fld * 95) | 0;
+          cr = (_lp(cr, flv,      fld * 0.72)) | 0;
+          cg = (_lp(cg, flv + 5,  fld * 0.72)) | 0;
+          cb = (_lp(cb, flv + 22, fld * 0.72)) | 0;
         }
       }
 
-      // trail overlay (recent path, visible cells only)
-      if (!dim && c.trail>=0 && c.trail<30 && !c.base && !c.cp) {
-        var fade=1-c.trail/30;
-        glyph='.';
-        color='rgba(160,120,55,'+(0.35+fade*0.5)+')';
-      }
-
-      // safe zone background hint
-      if (c.safe && !dim) {
-        ctx.fillStyle='rgba(0,80,35,0.35)';
-        ctx.fillRect(px, py, CW, CH);
-      }
-
-      ctx.fillStyle=color;
-      ctx.fillText(glyph, px, py);
+      // Subtle film grain applied to every pixel
+      var gn = ((gr() * 12 - 6) | 0);
+      buf[idx]     = Math.min(255, Math.max(0, cr + gn));
+      buf[idx + 1] = Math.min(255, Math.max(0, cg + gn));
+      buf[idx + 2] = Math.min(255, Math.max(0, cb + gn));
+      buf[idx + 3] = 255;
     }
   }
 
-  // Night / day overlay
-  var na=nightAlpha();
-  if (na>0) { ctx.fillStyle='rgba(0,0,18,'+na+')'; ctx.fillRect(0,0,canvas.width,canvas.height); }
+  // Write pixel buffer to offscreen, then scale up to main canvas
+  offCtx.putImageData(_imgData, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(offscreen, 0, 0, canvas.width, canvas.height);
+
+  drawHUD();
 }
 
-function renderSide() {
-  ctx.font= FONT_SIZE+'px "Courier New", monospace';
-  ctx.textBaseline='top';
-  ctx.fillStyle='#000';
-  ctx.fillRect(0,0,canvas.width,canvas.height);
+function drawHUD() {
+  var fpx = Math.max(10, (canvas.height * 0.020) | 0);
+  var hh  = fpx + 10;
+  ctx.font = fpx + 'px "Courier New", monospace';
 
-  var hc=Math.floor(VC/2);
-  var sx=P.x-hc;
-  // row 0 = altitude 255, row VR-2 = altitude 0
-  function altToRow(h) { return Math.floor((1-h/255)*(VR-2)); }
+  // Top bar
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  ctx.fillRect(0, 0, canvas.width, hh);
+  var deg = ((camAngle * 180 / Math.PI) % 360 + 360) % 360 | 0;
+  ctx.fillStyle = '#4c5f80';
+  ctx.textBaseline = 'top';
+  ctx.fillText(
+    'MT-ENNUI' +
+    '   SEED:' + curSeed +
+    '   \u2220' + deg + '\u00b0' +
+    '   zoom:' + camZoom.toFixed(2) +
+    (autoRotate ? '   [AUTO]' : ''),
+    8, 5
+  );
 
-  for (var col=0; col<VC; col++) {
-    var wx=sx+col;
-    if (wx<0||wx>=WW) continue;
-    var th=getH(wx,P.y);
-    var topRow=altToRow(th);
-    var px=col*CW;
-    for (var row=topRow; row<VR-1; row++) {
-      var py=row*CH;
-      var t=terrainOf(255*(1-row/(VR-2)));
-      ctx.fillStyle = (row===topRow) ? t.c : dimHex(t.c,0.35);
-      ctx.fillText((row===topRow)?t.g:':', px, py);
-    }
-  }
-
-  // Player marker
-  var ph=getH(P.x,P.y), pr=altToRow(ph)-1;
-  if (pr>=0 && pr<VR) {
-    ctx.fillStyle='#fff';
-    ctx.fillText('@', hc*CW, pr*CH);
-  }
-
-  // Altitude ruler (left edge labels every 4 rows)
-  for (var r=0; r<VR-1; r+=4) {
-    var av=Math.round((1-r/(VR-2))*255);
-    ctx.fillStyle='#445566';
-    ctx.fillText(('   '+av).slice(-3), 0, r*CH);
-  }
-
-  // Ground line
-  ctx.fillStyle='#333';
-  for (var groundCol=0; groundCol<VC; groundCol++) ctx.fillText('-', groundCol*CW, (VR-1)*CH);
-
-  // Title bar
-  ctx.fillStyle='#556677';
-  ctx.font='bold '+FONT_SIZE+'px "Courier New", monospace';
-  ctx.fillText('SIDE VIEW  X:'+P.x+' Y:'+P.y+' ALT:'+Math.round(getH(P.x,P.y)), 0, 0);
-
-  // Night overlay
-  var na=nightAlpha();
-  if (na>0) { ctx.fillStyle='rgba(0,0,18,'+(na*0.65)+')'; ctx.fillRect(0,0,canvas.width,canvas.height); }
+  // Bottom bar
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  ctx.fillRect(0, canvas.height - hh, canvas.width, hh);
+  ctx.fillStyle = '#374858';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText(
+    'Q/E \u25c4\u25ba Rotate    A Auto-rotate    Z/X Zoom    R New seed',
+    8, canvas.height - 5
+  );
 }
 
-function render() {
-  if (!ctx) return;
-  // Always sync viewport size from actual canvas dimensions
-  VC = Math.floor(canvas.width  / CW) || 72;
-  VR = Math.floor(canvas.height / CH) || 26;
-  ctx.fillStyle='#000';
-  ctx.fillRect(0,0,canvas.width,canvas.height);
-
-  if (VIEW==='overhead') renderOverhead();
-  else renderSide();
-
-  // Death overlay
-  if (GS==='dead') {
-    ctx.fillStyle='rgba(55,0,0,0.65)';
-    ctx.fillRect(0,0,canvas.width,canvas.height);
-    ctx.fillStyle='#ff3333';
-    ctx.font='bold 22px monospace';
-    ctx.textAlign='center';
-    ctx.fillText('YOU HAVE FALLEN', canvas.width/2, canvas.height/2-18);
-    ctx.font='13px monospace';
-    ctx.fillStyle='#cc8888';
-    ctx.fillText('Returning to last checkpoint...', canvas.width/2, canvas.height/2+10);
-    ctx.textAlign='left';
-    ctx.textBaseline='top';
-  }
-}
-
-// ─── GAME LOOP ────────────────────────────────────────────────────────────────
-var lastTs=0;
+// ─── ANIMATION LOOP ──────────────────────────────────────────────────────────
+var prevTs = 0;
 function loop(ts) {
-  if (ts-lastTs >= TICK) { lastTs=ts; tickSim(); render(); }
+  var dt = ts - prevTs;
+  if (dt < 0 || dt > 200) dt = 16;
+  prevTs = ts;
+
+  if (autoRotate) camAngle += AUTO_RATE * dt;
+
+  render(ts);
   requestAnimationFrame(loop);
 }
 
-// ─── INPUT ────────────────────────────────────────────────────────────────────
-var keyMap = {
-  ArrowUp:   function(){move(0,-1);},  w:function(){move(0,-1);}, W:function(){move(0,-1);},
-  ArrowDown: function(){move(0, 1);},  s:function(){move(0, 1);}, S:function(){move(0, 1);},
-  ArrowLeft: function(){move(-1,0);},  a:function(){move(-1,0);}, A:function(){move(-1,0);},
-  ArrowRight:function(){move( 1,0);},  d:function(){move( 1,0);}, D:function(){move( 1,0);},
-  x:doPickup, X:doPickup,
-  p:doPress,  P:doPress,
-  n:doPlant,  N:doPlant,
-  h:doRest,   H:doRest,
-  v:function(){VIEW=VIEW==='overhead'?'side':'overhead'; updateHUD();},
-  V:function(){VIEW=VIEW==='overhead'?'side':'overhead'; updateHUD();}
-};
-
-document.addEventListener('keydown', function(e) {
-  var fn=keyMap[e.key];
-  if (fn) { e.preventDefault(); fn(); }
+// ─── INPUT ───────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', function (e) {
+  switch (e.key) {
+    case 'q': case 'Q': case 'ArrowLeft':  camAngle -= ROT_STEP; break;
+    case 'e': case 'E': case 'ArrowRight': camAngle += ROT_STEP; break;
+    case 'a': case 'A': autoRotate = !autoRotate; break;
+    case 'z': case 'Z': camZoom = Math.min(3.0, camZoom + 0.15); break;
+    case 'x': case 'X': camZoom = Math.max(0.35, camZoom - 0.15); break;
+    case 'r': case 'R': genWorld(Math.floor(Math.random() * 999983) + 1); break;
+    default: return;
+  }
+  e.preventDefault();
 });
 
-document.getElementById('hud-view').addEventListener('click', function() {
-  VIEW=VIEW==='overhead'?'side':'overhead'; updateHUD();
-});
-
-// ─── BOOT ─────────────────────────────────────────────────────────────────────
-window.addEventListener('load', function() {
+// ─── BOOT ────────────────────────────────────────────────────────────────────
+window.addEventListener('load', function () {
   initCanvas();
-  init();
+  genWorld(Math.floor(Math.random() * 999983) + 1);
   requestAnimationFrame(loop);
 });
 
-window.addEventListener('resize', function() {
-  resizeCanvas();
-  render();
+window.addEventListener('resize', function () {
+  resize();
 });
 
 })();
