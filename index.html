@@ -17,11 +17,7 @@ canvas { display: block; }
 'use strict';
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
-var N   = 128;   // world grid side (heightmap is N×N)
-var FPX = 13;    // font size px
-var CW  = 8;     // cell width  (re-measured after font load)
-var CH  = 15;    // cell height
-var COLS = 100, ROWS = 40;  // screen grid dimensions (recalculated on resize)
+var N = 128;   // world grid side (heightmap is N×N)
 
 // ─── SEEDED PRNG (xorshift32) ────────────────────────────────────────────────
 var _seed = 1;
@@ -134,22 +130,35 @@ function sfog(wx, wz) {
        + fogmap[i00 + N + 1] * fx       * fz;
 }
 
-// ─── TERRAIN ZONES ───────────────────────────────────────────────────────────
-var ZONES = [
-  { max: 0.06, g: '~', r: 38,  gv: 70,  b: 118 },  // water / deep valley
-  { max: 0.15, g: '.', r: 50,  gv: 93,  b: 52  },  // lowland
-  { max: 0.27, g: ',', r: 66,  gv: 115, b: 46  },  // meadow
-  { max: 0.40, g: 'T', r: 40,  gv: 85,  b: 33  },  // forest
-  { max: 0.53, g: ';', r: 98,  gv: 88,  b: 60  },  // scrub / heather
-  { max: 0.66, g: '+', r: 128, gv: 116, b: 80  },  // rocky
-  { max: 0.80, g: '#', r: 150, gv: 141, b: 131 },  // cliff
-  { max: 0.92, g: '^', r: 193, gv: 190, b: 183 },  // peak
-  { max: 1.01, g: '*', r: 226, gv: 230, b: 236 }   // snow summit
-];
-function zoneOf(h) {
-  for (var i = 0; i < ZONES.length; i++) if (h <= ZONES[i].max) return ZONES[i];
-  return ZONES[ZONES.length - 1];
-}
+// ─── COLOR RAMP (pre-computed 256-entry lookup table) ────────────────────────
+// elevation 0=valley → 1=snow peak, smoothly interpolated
+var _RAMP_N = 256;
+var _RAMP   = new Uint8Array(_RAMP_N * 3);
+(function () {
+  // [elevation_stop, r, g, b]
+  var stops = [
+    [0.00,  24,  45,  85],   // deep shadow / water
+    [0.05,  38,  70, 110],   // valley bottom
+    [0.12,  50,  93,  52],   // lowland grass
+    [0.22,  66, 115,  46],   // meadow
+    [0.35,  40,  85,  33],   // forest
+    [0.46,  86,  78,  50],   // scrub / heath
+    [0.58, 128, 116,  80],   // rocky
+    [0.72, 150, 141, 131],   // cliff
+    [0.86, 193, 190, 183],   // peak
+    [1.00, 230, 234, 240]    // snow summit
+  ];
+  for (var i = 0; i < _RAMP_N; i++) {
+    var h = i / (_RAMP_N - 1), si = 1;
+    while (si < stops.length - 1 && h > stops[si][0]) si++;
+    var lo = stops[si - 1], hi = stops[si];
+    var tt = (lo[0] === hi[0]) ? 0 : (h - lo[0]) / (hi[0] - lo[0]);
+    tt = tt * tt * (3 - 2 * tt); // smoothstep
+    _RAMP[i * 3]     = (lo[1] + tt * (hi[1] - lo[1])) | 0;
+    _RAMP[i * 3 + 1] = (lo[2] + tt * (hi[2] - lo[2])) | 0;
+    _RAMP[i * 3 + 2] = (lo[3] + tt * (hi[3] - lo[3])) | 0;
+  }
+}());
 
 // ─── CAMERA ──────────────────────────────────────────────────────────────────
 var camAngle   = 0.4;   // orbit angle (radians)
@@ -159,20 +168,28 @@ var ROT_STEP   = Math.PI / 12;   // 15° per manual key press
 var AUTO_RATE  = 0.00045;        // rad / ms  (smooth auto-rotate)
 
 // ─── CANVAS ──────────────────────────────────────────────────────────────────
+// Two-layer approach:
+//   offscreen – half-res pixel buffer for terrain (cheap putImageData)
+//   canvas    – full-res main canvas: receives scaled terrain + HUD text
 var canvas, ctx;
+var offscreen, offCtx;
+var PW = 1, PH = 1;   // offscreen pixel dimensions
+
 function initCanvas() {
-  canvas = document.getElementById('gc');
-  ctx    = canvas.getContext('2d');
+  canvas    = document.getElementById('gc');
+  ctx       = canvas.getContext('2d');
+  offscreen = document.createElement('canvas');
+  offCtx    = offscreen.getContext('2d');
   resize();
 }
 function resize() {
   canvas.width  = window.innerWidth;
   canvas.height = window.innerHeight;
-  ctx.font = FPX + 'px "Courier New", monospace';
-  CW   = Math.ceil(ctx.measureText('M').width);
-  CH   = Math.ceil(FPX * 1.32);
-  COLS = Math.max(20, Math.floor(canvas.width  / CW));
-  ROWS = Math.max(10, Math.floor(canvas.height / CH));
+  PW = Math.max(1, canvas.width  >> 1);  // half screen → upscaled 2× for terrain
+  PH = Math.max(1, canvas.height >> 1);
+  offscreen.width  = PW;
+  offscreen.height = PH;
+  _imgData = null;   // force ImageData recreate next frame
 }
 
 // ─── GRAIN RNG (fast xorshift, separate from world PRNG) ─────────────────────
@@ -183,50 +200,46 @@ function gr() {
 }
 
 // ─── RENDERING ───────────────────────────────────────────────────────────────
-var fogT = 0;   // increases over time; drives rolling fog animation
+var fogT     = 0;
+var _imgData = null;   // reused ImageData
 
 function render(ts) {
   if (!ctx) return;
   fogT = ts * 0.00022;
 
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.font = FPX + 'px "Courier New", monospace';
-  ctx.textBaseline = 'top';
+  var W = PW, H = PH;
+
+  // Allocate (or reuse) the ImageData pixel buffer
+  if (!_imgData || _imgData.width !== W || _imgData.height !== H) {
+    _imgData = offCtx.createImageData(W, H);
+  }
+  var buf = _imgData.data;
 
   // Camera direction vectors (orthographic orbit)
-  var fX = Math.cos(camAngle), fZ = Math.sin(camAngle);  // forward (into scene)
-  var rX = -fZ,                rZ = fX;                   // right (lateral)
-  var cx = N * 0.5,            cz = N * 0.5;              // world centre
+  var fX = Math.cos(camAngle), fZ = Math.sin(camAngle);
+  var rX = -fZ,                rZ = fX;
+  var cx = N * 0.5,            cz = N * 0.5;
 
   // View geometry (world units)
-  var halfW = (N * 0.52) / camZoom;   // lateral half-width
-  var halfD = N * 0.62;               // depth half-range along forward axis
-  var step  = 0.80;                   // world-unit step for depth march
+  var halfW = (N * 0.52) / camZoom;
+  var halfD = N * 0.62;
+  var step  = 1.5;   // world-unit depth step
 
-  // Layout: a few rows of sky at top, ground strip at bottom
-  var SKY  = Math.max(2, Math.round(ROWS * 0.08));
-  var GND  = ROWS - 2;
-  var HROW = GND - SKY;    // rows available for terrain height mapping
-
-  // Reseed grain per frame so it animates (film-grain feel)
-  _gs = ((ts * 7919 + 0xBEEF) | 1) >>> 0;
+  // Screen layout (pixel rows in the half-res buffer)
+  var skyH  = Math.max(2, (H * 0.09) | 0);
+  var gndY  = H - Math.max(2, (H * 0.025) | 0);
+  var terrH = gndY - skyH;
 
   // ── Per-column pre-scan ──────────────────────────────────────────────────
-  // For each screen column we march along the forward axis and record:
-  //   maxH        – silhouette height (0..1)
-  //   depthAtMax  – depth value d where maxH was found (near=-halfD, far=+halfD)
-  //   fogAtMax    – fog density at the silhouette point
-  //   avgFogLow   – mean fog in the valley band (h < 0.28), for fog-layer rendering
-  var colMaxH   = new Float32Array(COLS);
-  var colDepth  = new Float32Array(COLS);
-  var colFogMax = new Float32Array(COLS);
-  var colFogLow = new Float32Array(COLS);
+  var colMaxH   = new Float32Array(W);
+  var colDepth  = new Float32Array(W);
+  var colFogMax = new Float32Array(W);
+  var colFogLow = new Float32Array(W);
+  var colRim    = new Float32Array(W);  // lateral slope shading
 
-  for (var c = 0; c < COLS; c++) {
-    var lat = (c / (COLS - 1) - 0.5) * 2 * halfW;
-    var bx  = cx + lat * rX;
-    var bz  = cz + lat * rZ;
+  for (var c = 0; c < W; c++) {
+    var lat = (c / (W - 1) - 0.5) * 2 * halfW;
+    var bx  = cx + lat * rX, bz = cz + lat * rZ;
 
     var maxH = 0, depthAtMax = 0, fogAtMax = 0, fogLowSum = 0, fogLowCnt = 0;
 
@@ -234,8 +247,7 @@ function render(ts) {
       var wx = bx + d * fX, wz = bz + d * fZ;
       if (wx < 0 || wx >= N || wz < 0 || wz >= N) continue;
 
-      var hv = sh(wx, wz);
-      // Animated fog offset: gentle sinusoidal drift for rolling-fog effect
+      var hv  = sh(wx, wz);
       var fwx = wx + Math.cos(fogT + wz * 0.05) * 5.5;
       var fwz = wz + Math.sin(fogT * 0.72 + wx * 0.04) * 4.5;
       var fv  = sfog(fwx, fwz);
@@ -250,127 +262,136 @@ function render(ts) {
     colFogLow[c] = fogLowCnt > 0 ? fogLowSum / fogLowCnt : 0;
   }
 
-  // ── Per-cell rendering ───────────────────────────────────────────────────
-  for (var c2 = 0; c2 < COLS; c2++) {
-    var px       = c2 * CW;
-    var maxH2    = colMaxH[c2];
-    var df       = (colDepth[c2] + halfD) / (2 * halfD);  // 0=near, 1=far
-    var fogMax2  = colFogMax[c2];
-    var fogLow2  = colFogLow[c2];
-    var peakRow  = SKY + Math.round((1 - maxH2) * HROW);  // silhouette row
+  // Lateral slope shading: left-lit (leftward slope = brighter)
+  for (var cc = 0; cc < W; cc++) {
+    var lh = cc > 0     ? colMaxH[cc - 1] : colMaxH[cc];
+    var rh = cc < W - 1 ? colMaxH[cc + 1] : colMaxH[cc];
+    colRim[cc] = (lh - rh) * 2.2;   // +ve = left face lit, −ve = right face shadowed
+  }
 
-    for (var r = 0; r < ROWS; r++) {
-      var py = r * CH;
+  // ── Per-pixel rendering ──────────────────────────────────────────────────
+  _gs = ((ts * 7919 + 0xBEEF) | 1) >>> 0;  // reseed grain per frame
 
-      // ── Sky rows ──
-      if (r < SKY) {
-        if (gr() < 0.010) {
-          var sv = 18 + (gr() * 12 | 0);
-          ctx.fillStyle = 'rgb(' + sv + ',' + sv + ',' + (sv + 7) + ')';
-          ctx.fillText('`', px, py);
-        }
-        continue;
-      }
+  for (var y = 0; y < H; y++) {
+    var yW = y * W;
 
-      // ── Ground strip ──
-      if (r >= GND) {
-        ctx.fillStyle = 'rgb(20,24,20)';
-        ctx.fillText(gr() < 0.55 ? '_' : '.', px, py);
-        continue;
-      }
+    for (var x = 0; x < W; x++) {
+      var idx = (yW + x) << 2;
 
-      // Altitude this row represents (1=summit, 0=valley floor)
-      var rowAlt = 1 - (r - SKY) / HROW;
+      var maxH2 = colMaxH[x];
+      var df    = (colDepth[x] + halfD) / (2 * halfD);  // 0=near, 1=far
+      var fogM  = colFogMax[x];
+      var fogL  = colFogLow[x];
+      var peakY = (skyH + (1 - maxH2) * terrH) | 0;
 
-      // ── Air above terrain silhouette ──
-      if (r < peakRow) {
-        // Sparse background grain
-        if (gr() < 0.017) {
-          var av = 16 + (gr() * 11 | 0);
-          ctx.fillStyle = 'rgb(' + av + ',' + av + ',' + (av + 6) + ')';
-          ctx.fillText('.', px, py);
-        }
-        // Rolling valley fog tendrils that bleed upward into lower air
-        if (rowAlt < 0.30 && fogLow2 > 0.25) {
-          var fd = (fogLow2 - 0.25) / 0.75 * (0.30 - rowAlt) / 0.30;
-          fd = fd * fd;   // sharpen gradient near silhouette
-          if (gr() < fd * 0.52) {
-            var fv2 = 52 + (fd * 88 | 0);
-            ctx.fillStyle = 'rgb(' + fv2 + ',' + (fv2 + 5) + ',' + (fv2 + 20) + ')';
-            ctx.fillText(gr() < 0.45 ? '~' : '-', px, py);
+      var cr, cg, cb;
+
+      if (y < skyH) {
+        // ── Sky gradient ──
+        var st = y / skyH;
+        cr = ( 3 + st * 10) | 0;
+        cg = ( 4 + st *  8) | 0;
+        cb = (10 + st * 24) | 0;
+
+      } else if (y >= gndY) {
+        // ── Ground strip ──
+        cr = 14; cg = 18; cb = 14;
+
+      } else if (y < peakY) {
+        // ── Air above terrain silhouette ──
+        var rowAlt = 1 - (y - skyH) / terrH;
+        cr = 3; cg = 4; cb = 9;
+        // Valley fog bleeds upward into low-altitude air
+        if (rowAlt < 0.30 && fogL > 0.25) {
+          var fd = ((fogL - 0.25) / 0.75) * ((0.30 - rowAlt) / 0.30);
+          fd = fd * fd;
+          if (fd > 0.02) {
+            var fv2 = (50 + fd * 80) | 0;
+            cr = (_lp(cr, fv2,      fd * 0.65)) | 0;
+            cg = (_lp(cg, fv2 + 4,  fd * 0.65)) | 0;
+            cb = (_lp(cb, fv2 + 20, fd * 0.65)) | 0;
           }
         }
-        continue;
-      }
 
-      // ── Terrain ──
-      var z   = zoneOf(rowAlt);
-      var shd = 1.0 - df * 0.50;  // depth shading: near=bright, far=dark
-
-      // Fog blends terrain toward a blue-grey haze.
-      // Silhouette row: max 25% fog (always readable).
-      // Sub-silhouette rows: more fog allowed deeper into scene.
-      // Hard cap at 0.68 so terrain never disappears into flat grey.
-      var fb = (r === peakRow) ? fogMax2 * 0.25 : fogMax2 * df * 0.58;
-      fb = Math.min(0.68, fb);
-
-      var cr = z.r * shd,  cg = z.gv * shd,  cb = z.b * shd;
-      cr = cr + (92  - cr) * fb;
-      cg = cg + (100 - cg) * fb;
-      cb = cb + (128 - cb) * fb;
-
-      // Choose glyph: silhouette row shows zone char; fill rows show texture
-      var glyph;
-      if (r === peakRow) {
-        glyph = z.g;
       } else {
-        var band = r - peakRow;
-        glyph = band <= 1 ? z.g : ((c2 + r) & 3) < 1 ? ':' : '|';
-      }
+        // ── Terrain ──
+        var rowAlt2 = 1 - (y - skyH) / terrH;
 
-      ctx.fillStyle = 'rgb(' + (cr | 0) + ',' + (cg | 0) + ',' + (cb | 0) + ')';
-      ctx.fillText(glyph, px, py);
+        // Color from pre-computed ramp (smooth elevation gradient)
+        var ri  = Math.min(_RAMP_N - 1, (rowAlt2 * _RAMP_N) | 0);
+        var tcr = _RAMP[ri * 3], tcg = _RAMP[ri * 3 + 1], tcb = _RAMP[ri * 3 + 2];
 
-      // Valley fog layer: overlays low-altitude terrain cells
-      if (rowAlt < 0.22 && fogLow2 > 0.30) {
-        var fld = Math.min(0.72, (fogLow2 - 0.30) * (0.22 - rowAlt) / 0.22 * 1.9);
-        if (gr() < fld) {
-          var flv = 60 + (fld * 100 | 0);
-          ctx.fillStyle = 'rgba(' + flv + ',' + (flv + 6) + ',' + (flv + 24) + ',0.88)';
-          ctx.fillText(gr() < 0.38 ? '~' : (gr() < 0.55 ? '-' : '='), px, py);
+        // Shading: depth dimming + lateral slope rim light
+        var shd = Math.max(0.18, Math.min(1.5, (1.0 - df * 0.48) + colRim[x] * 0.5));
+
+        // Fog blend toward haze colour (88, 96, 124)
+        var fb;
+        if (y === peakY) {
+          shd += 0.18;  // rim glow at silhouette edge
+          fb   = fogM * 0.22;
+        } else {
+          fb = Math.min(0.68, fogM * df * 0.60);
+        }
+
+        cr = (_lp(tcr * shd,  88, fb)) | 0;
+        cg = (_lp(tcg * shd,  96, fb)) | 0;
+        cb = (_lp(tcb * shd, 124, fb)) | 0;
+
+        // Valley fog overlay on low-altitude terrain cells
+        if (rowAlt2 < 0.22 && fogL > 0.30) {
+          var fld = Math.min(0.72, (fogL - 0.30) * (0.22 - rowAlt2) / 0.22 * 1.9);
+          var flv = (55 + fld * 95) | 0;
+          cr = (_lp(cr, flv,      fld * 0.72)) | 0;
+          cg = (_lp(cg, flv + 5,  fld * 0.72)) | 0;
+          cb = (_lp(cb, flv + 22, fld * 0.72)) | 0;
         }
       }
+
+      // Subtle film grain applied to every pixel
+      var gn = ((gr() * 12 - 6) | 0);
+      buf[idx]     = Math.min(255, Math.max(0, cr + gn));
+      buf[idx + 1] = Math.min(255, Math.max(0, cg + gn));
+      buf[idx + 2] = Math.min(255, Math.max(0, cb + gn));
+      buf[idx + 3] = 255;
     }
   }
+
+  // Write pixel buffer to offscreen, then scale up to main canvas
+  offCtx.putImageData(_imgData, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(offscreen, 0, 0, canvas.width, canvas.height);
 
   drawHUD();
 }
 
 function drawHUD() {
-  var HH = CH + 2;
-  ctx.fillStyle = 'rgba(0,0,0,0.80)';
-  ctx.fillRect(0, 0, canvas.width, HH);
-  ctx.fillRect(0, canvas.height - HH, canvas.width, HH);
+  var fpx = Math.max(10, (canvas.height * 0.020) | 0);
+  var hh  = fpx + 10;
+  ctx.font = fpx + 'px "Courier New", monospace';
 
-  ctx.font = Math.round(FPX * 0.87) + 'px "Courier New", monospace';
-  ctx.textBaseline = 'top';
-
+  // Top bar
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  ctx.fillRect(0, 0, canvas.width, hh);
   var deg = ((camAngle * 180 / Math.PI) % 360 + 360) % 360 | 0;
   ctx.fillStyle = '#4c5f80';
+  ctx.textBaseline = 'top';
   ctx.fillText(
     'MT-ENNUI' +
     '   SEED:' + curSeed +
     '   \u2220' + deg + '\u00b0' +
     '   zoom:' + camZoom.toFixed(2) +
     (autoRotate ? '   [AUTO]' : ''),
-    8, 4
+    8, 5
   );
 
+  // Bottom bar
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  ctx.fillRect(0, canvas.height - hh, canvas.width, hh);
   ctx.fillStyle = '#374858';
   ctx.textBaseline = 'bottom';
   ctx.fillText(
     'Q/E \u25c4\u25ba Rotate    A Auto-rotate    Z/X Zoom    R New seed',
-    8, canvas.height - 4
+    8, canvas.height - 5
   );
 }
 
